@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>扫描印刷稿套色偏移校准</h1>
-    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览、残差分析与校准图导出</p>
+    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览、残差分析、差异忽略区框选与校准图导出</p>
   </header>
 
   <section class="toolbar">
@@ -93,10 +93,21 @@
     </div>
     <div class="diff-body">
       <figure class="diff-view">
-        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝未复核 · 红框＝缺陷 · 绿框＝可接受 · 加粗亮框＝当前选中；点击差异像素或表格行选中区域复核（坐标为参考图像素）</span></figcaption>
+        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝未复核 · 红框＝缺陷 · 绿框＝可接受 · 黄色虚线框＝忽略区 · 加粗亮框＝当前选中；按住左键拖框可添加忽略区（裁切线、装订孔等），点击差异像素或表格行选中区域复核，右键黄框或列表 ✕ 删除忽略区（坐标均为参考图像素）</span></figcaption>
         <canvas id="diffCanvas"></canvas>
       </figure>
       <div class="diff-side">
+        <div class="ignore-panel">
+          <h3>忽略区<span id="ignoreCount" class="ignore-count"></span></h3>
+          <p class="ignore-tip">在左侧差异视图上<strong>按住左键拖出矩形</strong>即可忽略该区域（越界自动裁到图像边界，零面积框不保存，重叠只排除一次）；点行选中，点 ✕ / 右键黄框 / 选中后按 Delete 删除。忽略区在掩码形成后、分组前排除。</p>
+          <table id="ignoreList">
+            <thead>
+              <tr><th>#</th><th>边框 (x, y, w, h)</th><th></th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="ignoreEmpty" class="diff-empty">尚无忽略区：在差异视图拖框添加。</p>
+        </div>
         <div id="reviewEditor" class="review-editor" hidden>
           <h3>人工复核 · 区域 <span id="reviewRegionNo"></span></h3>
           <p class="review-meta" id="reviewRegionMeta"></p>

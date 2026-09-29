@@ -231,6 +231,23 @@ button.del {
 .diff-side td, .diff-side th { padding: 4px 6px; }
 .diff-side .diff-empty { color: var(--muted); font-size: 13px; padding: 12px 4px; }
 
+/* 差异忽略区列表 */
+.ignore-panel {
+  border: 1px solid rgba(250, 204, 21, 0.45);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 8px 12px 10px;
+  margin-bottom: 10px;
+}
+.ignore-panel h3 { font-size: 13px; margin: 2px 0 4px; color: #facc15; }
+.ignore-count { color: var(--muted); font-size: 12px; font-weight: 400; }
+.ignore-tip { color: var(--muted); font-size: 12px; margin: 0 0 6px; line-height: 1.5; }
+.diff-side table#ignoreList { margin-bottom: 4px; }
+.diff-side tbody tr.ignore-selected { background: rgba(56, 189, 248, 0.14); cursor: pointer; }
+.diff-side tbody tr.ignore-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.diff-side tbody tr[data-ignore] { cursor: pointer; }
+#ignoreEmpty[hidden] { display: none; }
+
 /* 人工复核编辑器 */
 .review-editor {
   border: 1px solid var(--border);

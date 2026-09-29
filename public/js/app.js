@@ -22,18 +22,27 @@
  *  - 「差异区域」视图：两图已加载且当前拟合矩阵通过导出校验（checkExportMatrix）
  *    时，复用校准扫描图的 RGBA 重采样结果（Affine.transformRGBA）与参考图逐像素
  *    比较；仅统计双方 alpha 均 ≥ 128 的像素，任一 RGB 通道差值超过可调色差阈值
- *    即标为差异，差异掩码做八邻域连通分组并过滤小于可调最小面积的区域，按面积
- *    排序展示边框、像素数与参考图坐标范围。阈值 / 最小面积 / 点位 / 拟合模式或
- *    容差变化后去抖重算；条件失效（缺图、拟合无效、矩阵不可导出、参数非法）时
- *    清空旧标记并说明原因。全部像素处理在浏览器本地完成，图像不上传服务器。
+ *    即标为差异，差异掩码先应用忽略区（Affine.applyIgnoreRegions，在八邻域分组前
+ *    排除，重叠只排除一次），再做八邻域连通分组并过滤小于可调最小面积的区域，
+ *    按面积排序展示边框、像素数与参考图坐标范围。阈值 / 最小面积 / 点位 / 拟合
+ *    模式或容差变化后去抖重算；条件失效（缺图、拟合无效、矩阵不可导出、参数
+ *    非法）时清空旧标记并说明原因。全部像素处理在浏览器本地完成，不上传服务器。
+ *  - 差异忽略区：操作者可在差异视图按住左键拖出矩形（坐标按参考图原始像素，
+ *    松手即裁到图像边界后保存，零面积框不保存），用于排除裁切线、装订孔等本就
+ *    与参考图不同的位置；多个忽略区可重叠，重叠像素只排除一次。忽略区以黄框
+ *    列出并可点选，右侧忽略区列表可逐项删除（也可右键黄框或选中后按 Delete）。
+ *    每次增删忽略区，差异像素数、区域边框与人工复核结论均按新掩码立即重算；
+ *    旧结论仅按现有实际差异像素 IoU ≥ 0.5 且双方互为唯一重叠区域的规则继承，
+ *    拆分/合并导致匹配不唯一时显示未复核。更换任一图片时清空忽略区；条件失效
+ *    或参数非法时忽略区保留，条件恢复后重新生效。
  *  - 人工复核：点击差异表格行或差异视图画布内的差异像素选中区域，可标为
  *    「缺陷（defect）」或「可接受（acceptable）」并填写备注，表格列出结论与备注，
  *    画布按结论着色（红＝缺陷、绿＝可接受、橙＝未复核）。可导出含参考图坐标范围、
  *    像素数、结论与备注的复核 JSON（diff-review.json）。
- *    色差阈值、最小面积或控制点引发重算时，新老区域以区域内实际差异像素计算
+ *    色差阈值、最小面积、控制点或忽略区引发重算时，新老区域以区域内实际差异像素计算
  *    交并比（IoU，Affine.matchDiffRegions）；仅当 IoU ≥ 0.5 且双方互为唯一重叠
  *    区域时才继承复核结论与备注，其余新区域一律显示「未复核」——绝不按排序编号
- *    沿用。更换任一图片（含载入示例）时清空全部控制点与复核记录。
+ *    沿用。更换任一图片（含载入示例）时清空全部控制点、忽略区与复核记录。
  *  - 「局部套色偏移」诊断：两图已加载且当前拟合矩阵通过导出校验（与差异视图、
  *    校准扫描图导出同一条件）时，复用校准扫描图的同一份 RGBA 重采样结果
  *    （Affine.transformRGBA），由 Affine.analyzeLocalShifts 把参考图均匀分成
@@ -71,6 +80,12 @@
     diffReviews: {},         // { [index]: {verdict:'defect'|'acceptable', note, reviewedAt} }
     diffSelected: null,      // 当前选中的区域编号（diffResult 中的 index）
     diffPrev: null,          // 上次有效差异结果快照（{labels, width, height, reviews}），用于重算后 IoU 继承
+    // 差异忽略区（参考图原始像素坐标的裁剪后矩形 {x,y,width,height}）：
+    // 掩码形成后、八邻域分组前排除；仅在更换任一图片时清空
+    diffIgnoreRects: [],
+    ignoreSelected: null,    // 当前选中的忽略区下标（diffIgnoreRects 中的 index，从 1 起）
+    ignoreDrag: null,        // 差异视图拖框状态 {x0,y0,x,y}（画布像素坐标）
+    ignoreSuppressClick: false, // 拖框松手后的 click 事件已在 mouseup 处理，抑制随后的 click
     // 局部套色偏移分块诊断
     localTimer: null,        // 去抖句柄（拖动点位时合并重算）
     localResult: null        // 最近一次 analyzeLocalShifts 结果（条件失效时为 null）
@@ -87,6 +102,9 @@
   const COLOR_BOX_DEFECT = '#ef4444';   // 复核结论＝缺陷：红
   const COLOR_BOX_ACCEPT = '#22c55e';   // 复核结论＝可接受：绿
   const COLOR_BOX_SELECTED = '#38bdf8'; // 当前选中区域：亮蓝（加粗）
+  const COLOR_IGNORE = '#facc15';       // 忽略区边框/标签：黄
+  const COLOR_IGNORE_SEL = '#38bdf8';   // 当前选中忽略区：亮蓝
+  const IGNORE_DRAG_MIN_CSS = 2;        // 超过该移动（CSS 像素）视为框选，否则视为点击
   const DIFF_MASK_ALPHA = 0.55;     // 差异掩码叠加不透明度
   const DIFF_MAX_TABLE_ROWS = 200;  // 区域表最多列出的行数
   const REVIEW_VERDICTS = { defect: '缺陷', acceptable: '可接受' };
@@ -130,6 +148,9 @@
   const btnVerdictDefect = $('btnVerdictDefect');
   const btnVerdictAccept = $('btnVerdictAccept');
   const btnReviewClear = $('btnReviewClear');
+  const ignoreListBody = $('ignoreList').querySelector('tbody');
+  const ignoreEmptyEl = $('ignoreEmpty');
+  const ignoreCountEl = $('ignoreCount');
   const localCanvas = $('localCanvas');
   const localStatsEl = $('localStats');
   const localHintEl = $('localHint');
@@ -773,16 +794,20 @@
     return state.diffCache;
   }
 
-  // 更换任一图片时清空全部人工复核记录（连同上次结果快照与选中状态）
+  // 更换任一图片时清空全部人工复核记录与忽略区（连同上次结果快照与选中状态）
   function resetDiffReviews() {
     state.diffReviews = {};
     state.diffSelected = null;
     state.diffPrev = null;
+    state.diffIgnoreRects = [];
+    state.ignoreSelected = null;
+    state.ignoreDrag = null;
   }
 
   // 条件失效 / 参数非法时清空旧标记并说明原因。
-  // 注意：不触碰 diffPrev / diffReviews——它们只在「换图」时清空；阈值等参数
-  // 暂时非法后恢复合法值时，仍应按实际差异像素的 IoU 尝试继承既有复核。
+  // 注意：不触碰 diffPrev / diffReviews / diffIgnoreRects——它们只在「换图」时
+  // 清空；阈值等参数暂时非法后恢复合法值时，仍应按实际差异像素的 IoU 尝试继承
+  // 既有复核，忽略区也原样保留并在条件恢复后重新生效（便于恢复）。
   function clearDiff(reason) {
     if (state.diffTimer !== null) {
       clearTimeout(state.diffTimer);
@@ -791,12 +816,14 @@
     state.diffResult = null;
     state.diffCache = null;
     state.diffSelected = null;
+    state.ignoreDrag = null;
     diffStatsEl.textContent = '';
     diffTableBody.innerHTML = '';
     btnExportReview.disabled = true;
     diffHintEl.textContent = reason ? '差异区域暂不可用：' + reason : '';
     drawDiffView();
     renderReviewEditor();
+    renderIgnoreList();
   }
 
   function runDiffUpdate() {
@@ -818,6 +845,14 @@
       const built = Affine.buildDifferenceMask(
         cache.refData, cache.calibratedData, w, h, params.threshold
       );
+      // 忽略区在差异掩码形成后、八邻域分组前排除（重叠只排除一次，越界裁到边界，
+      // 零面积框不保存）；返回的 rects 为实际裁剪后的忽略区，作为新的当前状态
+      const ignored = Affine.applyIgnoreRegions(built.mask, w, h, state.diffIgnoreRects);
+      state.diffIgnoreRects = ignored.rects;
+      if (state.ignoreSelected !== null && state.ignoreSelected > state.diffIgnoreRects.length) {
+        state.ignoreSelected = null;
+      }
+      built.diffCount -= ignored.ignoredCount; // 差异数量按排除后的新掩码统计
       // 分组会就地清空掩码，先据此生成红色差异覆盖层（离屏 canvas）
       const overlay = makeMaskOverlay(built.mask, w, h);
       const grouped = Affine.groupDiffRegions(built.mask, w, h, params.minArea);
@@ -860,6 +895,8 @@
         filteredCount: grouped.filteredCount,
         threshold: built.colorThreshold,
         minArea: grouped.minArea,
+        ignoredCount: ignored.ignoredCount, // 被忽略区排除的差异像素数（排除前口径）
+        ignoreRects: ignored.rects,
         overlay
       };
       // 记录本次有效结果快照（labels + 复核），供下一次重算做 IoU 匹配
@@ -874,6 +911,7 @@
       renderDiffStats();
       renderDiffTable();
       renderReviewEditor();
+      renderIgnoreList();
     } catch (err) {
       clearDiff(err.message || String(err));
     }
@@ -952,6 +990,87 @@
         ctx.strokeRect(b.x - scale, b.y - scale, b.width + 2 * scale, b.height + 2 * scale);
       }
     }
+
+    // 忽略区：半透明黄底 + 黄色虚线框（选中者加粗亮蓝），框内标注序号，
+    // 序号与右侧忽略区列表一致（按框选先后排列）
+    r.ignoreRects.forEach((rc, i) => {
+      const selected = state.ignoreSelected === i + 1;
+      ctx.fillStyle = selected ? 'rgba(56, 189, 248, 0.16)' : 'rgba(250, 204, 21, 0.14)';
+      ctx.fillRect(rc.x, rc.y, rc.width, rc.height);
+      ctx.save();
+      ctx.setLineDash([6 * scale, 4 * scale]);
+      ctx.strokeStyle = selected ? COLOR_IGNORE_SEL : COLOR_IGNORE;
+      ctx.lineWidth = (selected ? 2.5 : 1.5) * scale;
+      ctx.strokeRect(rc.x + 0.5, rc.y + 0.5, rc.width - 1, rc.height - 1);
+      ctx.restore();
+      const label = '忽略' + (i + 1);
+      ctx.font = `bold ${12 * scale}px system-ui, sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.lineWidth = 3 * scale;
+      ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+      ctx.strokeText(label, rc.x + 3 * scale, rc.y + 3 * scale);
+      ctx.fillStyle = selected ? COLOR_IGNORE_SEL : COLOR_IGNORE;
+      ctx.fillText(label, rc.x + 3 * scale, rc.y + 3 * scale);
+    });
+
+    // 正在拖出的忽略区橡皮筋（原始拖拽坐标，越界部分由 canvas 自然裁掉）
+    if (state.ignoreDrag) {
+      const d = state.ignoreDrag;
+      ctx.save();
+      ctx.setLineDash([5 * scale, 3 * scale]);
+      ctx.strokeStyle = COLOR_IGNORE;
+      ctx.lineWidth = 1.5 * scale;
+      ctx.strokeRect(
+        Math.min(d.x0, d.x), Math.min(d.y0, d.y),
+        Math.abs(d.x - d.x0), Math.abs(d.y - d.y0)
+      );
+      ctx.restore();
+    }
+  }
+
+  // 忽略区命中测试：返回点击位置所属忽略区序号（1 起，后框选的在上层），否则 null
+  function hitIgnoreRect(x, y) {
+    const rects = (state.diffResult && state.diffResult.ignoreRects) || state.diffIgnoreRects;
+    for (let i = rects.length - 1; i >= 0; i--) {
+      const rc = rects[i];
+      if (x >= rc.x && x < rc.x + rc.width && y >= rc.y && y < rc.y + rc.height) return i + 1;
+    }
+    return null;
+  }
+
+  // ---------- 差异忽略区操作 ----------
+  // 拖框结束：按参考图原始像素坐标裁剪保存（越界裁到边界，零面积框不保存），
+  // 随后立即按新掩码重算差异数量、区域边框与人工复核结论
+  function addIgnoreRectFromDrag(x1, y1, x2, y2) {
+    const r = state.diffResult;
+    if (!r) return;
+    const clipped = Affine.clipIgnoreRect(x1, y1, x2, y2, r.width, r.height);
+    if (!clipped) return; // 零面积框（含越界后无交）不保存
+    state.diffIgnoreRects.push(clipped);
+    state.ignoreSelected = state.diffIgnoreRects.length;
+    state.diffSelected = null;
+    runDiffUpdate(); // 增删忽略区：差异数量、边框与复核结论均按新掩码立即重算
+  }
+
+  function deleteIgnoreRect(index1) {
+    const i = index1 - 1;
+    if (i < 0 || i >= state.diffIgnoreRects.length) return;
+    state.diffIgnoreRects.splice(i, 1);
+    if (state.ignoreSelected === index1) state.ignoreSelected = null;
+    else if (state.ignoreSelected !== null && state.ignoreSelected > index1) {
+      state.ignoreSelected -= 1; // 后续忽略区序号前移
+    }
+    runDiffUpdate();
+  }
+
+  function selectIgnoreRect(index1) {
+    state.ignoreSelected = index1;
+    if (index1 !== null) state.diffSelected = null; // 忽略区与差异区域选中互斥
+    drawDiffView();
+    renderDiffTable();
+    renderReviewEditor();
+    renderIgnoreList();
   }
 
   // 人工复核结论统计：缺陷 / 可接受 / 未复核各多少个区域
@@ -968,6 +1087,29 @@
     return ` · 复核：缺陷 ${defect}、可接受 ${accept}、未复核 ${pending}`;
   }
 
+  // 忽略区列表：始终反映当前图片保留的忽略区（条件失效时仍可查看/删除，便于恢复）
+  function renderIgnoreList() {
+    const rects = state.diffIgnoreRects;
+    ignoreEmptyEl.hidden = rects.length > 0;
+    ignoreCountEl.textContent = rects.length ? `（${rects.length} 个）` : '';
+    ignoreListBody.innerHTML = rects.map((rc, i) => {
+      const n = i + 1;
+      const cls = state.ignoreSelected === n ? ' class="ignore-selected"' : '';
+      return `<tr${cls} data-ignore="${n}" title="点击选中，右键黄框或点 ✕ 删除">
+        <td>${n}</td>
+        <td>(${rc.x}, ${rc.y}, ${rc.width}×${rc.height})</td>
+        <td><button class="del" data-ignore-del="${n}" title="删除忽略区 ${n}">✕</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 忽略区统计：框数与被排除的差异像素数（重叠部分只排除一次）
+  function ignoreSummary() {
+    const r = state.diffResult;
+    if (!r || r.ignoreRects.length === 0) return '';
+    return ` · 忽略区 ${r.ignoreRects.length} 个（已排除 ${r.ignoredCount} 差异像素）`;
+  }
+
   function renderDiffStats() {
     const r = state.diffResult;
     if (!r) {
@@ -980,7 +1122,7 @@
     if (r.diffCount === 0) {
       diffStatsEl.textContent =
         `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
-        `色差阈值 ${r.threshold}：未发现差异像素。`;
+        `色差阈值 ${r.threshold}：未发现差异像素。` + ignoreSummary();
       return;
     }
     diffStatsEl.textContent =
@@ -988,6 +1130,7 @@
       `差异像素 ${r.diffCount}（${fmt(pct, 2)}%）· ` +
       `保留区域 ${r.regions.length} 个、共 ${r.keptPixelCount} 像素` +
       `（最小面积 ${r.minArea}，过滤散点 ${r.filteredCount} 像素）· 色差阈值 ${r.threshold}` +
+      ignoreSummary() +
       reviewSummary();
   }
 
@@ -1038,13 +1181,18 @@
   // 选中一个差异区域（idx 为当前 diffResult 中的区域编号；null 取消选中）
   function selectDiffRegion(idx) {
     state.diffSelected = idx;
+    if (idx !== null) state.ignoreSelected = null; // 忽略区与差异区域选中互斥
     drawDiffView();
     renderDiffTable();
     renderReviewEditor();
+    renderIgnoreList();
   }
 
-  // 差异视图画布点击：命中差异像素所属保留区域则选中，点空白处取消选中
+  // 差异视图画布单击：命中忽略区则选中忽略区；否则命中差异像素所属保留区域则
+  // 选中，点空白处取消选中
   function onDiffCanvasClick(e) {
+    // 拖框松手时已在 mouseup 完成处理，抑制浏览器紧随其后的 click
+    if (state.ignoreSuppressClick) { state.ignoreSuppressClick = false; return; }
     const r = state.diffResult;
     if (!r) return;
     const pos = eventToCanvas(diffCanvas, e);
@@ -1053,8 +1201,60 @@
       selectDiffRegion(null);
       return;
     }
+    // 忽略区优先命中（黄框覆盖在差异层之上）
+    const ig = hitIgnoreRect(x, y);
+    if (ig !== null) { selectIgnoreRect(ig); return; }
     const idx = r.labels[y * r.width + x];
     selectDiffRegion(idx ? idx : null);
+  }
+
+  // 按住左键拖出忽略区矩形（参考图原始像素坐标）；位移不足阈值视为普通点击
+  function onDiffCanvasMouseDown(e) {
+    if (e.button !== 0) return;
+    if (!state.diffResult) return;
+    const pos = eventToCanvas(diffCanvas, e);
+    state.ignoreDrag = { x0: pos.x, y0: pos.y, x: pos.x, y: pos.y };
+    state.ignoreSuppressClick = false; // 新一次按下开始，重置上次拖框遗留的抑制标记
+    e.preventDefault();
+  }
+
+  function onDiffCanvasMouseMove(e) {
+    if (!state.ignoreDrag) return;
+    const pos = eventToCanvas(diffCanvas, e);
+    state.ignoreDrag.x = pos.x;
+    state.ignoreDrag.y = pos.y;
+    drawDiffView();
+  }
+
+  function onDiffCanvasMouseUp(e) {
+    if (e.button !== 0 || !state.ignoreDrag) return;
+    const d = state.ignoreDrag;
+    state.ignoreDrag = null;
+    // 画布像素位移换算为 CSS 像素（与显示缩放相除），超过阈值才算框选，否则按点击
+    const toCss = diffCanvas.width / canvasScale(diffCanvas) > 0
+      ? 1 / canvasScale(diffCanvas) : 1; // 画布像素 → CSS 像素
+    const movedCss = Math.max(Math.abs(d.x - d.x0), Math.abs(d.y - d.y0)) * toCss;
+    state.ignoreSuppressClick = movedCss >= IGNORE_DRAG_MIN_CSS;
+    if (state.ignoreSuppressClick) {
+      // 框选：裁剪到边界后保存（零面积框不保存），立即按新掩码重算
+      addIgnoreRectFromDrag(d.x0, d.y0, d.x, d.y);
+    } else {
+      drawDiffView(); // 仅点击：清掉橡皮筋，后续 click 事件做区域选中
+    }
+  }
+
+  // 右键忽略区黄框：删除该忽略区（右键差异像素仍不处理，避免与删控制点操作混淆）
+  function onDiffCanvasContextMenu(e) {
+    const r = state.diffResult;
+    if (!r) return;
+    const pos = eventToCanvas(diffCanvas, e);
+    const x = Math.floor(pos.x), y = Math.floor(pos.y);
+    if (x < 0 || y < 0 || x >= r.width || y >= r.height) return;
+    const ig = hitIgnoreRect(x, y);
+    if (ig !== null) {
+      e.preventDefault();
+      deleteIgnoreRect(ig);
+    }
   }
 
   function renderReviewEditor() {
@@ -1156,6 +1356,11 @@
       defectCount: defect,
       acceptableCount: acceptable,
       pendingCount: regions.length - defect - acceptable,
+      // 忽略区在差异掩码形成后、八邻域分组前排除（坐标为参考图像素，重叠只排除一次）
+      ignoredDiffPixelCount: r.ignoredCount,
+      ignoreRegions: r.ignoreRects.map((rc) => ({
+        x: rc.x, y: rc.y, width: rc.width, height: rc.height
+      })),
       regions,
       exportedAt: new Date().toISOString()
     });
@@ -1539,7 +1744,19 @@
       const row = e.target.closest('tr[data-idx]');
       if (row) selectDiffRegion(Number(row.dataset.idx));
     });
+    // 差异视图：单击选中差异区域/忽略区，按住左键拖出忽略区，右键黄框删除
+    diffCanvas.addEventListener('mousedown', onDiffCanvasMouseDown);
+    window.addEventListener('mousemove', onDiffCanvasMouseMove);
+    window.addEventListener('mouseup', onDiffCanvasMouseUp);
     diffCanvas.addEventListener('click', onDiffCanvasClick);
+    diffCanvas.addEventListener('contextmenu', onDiffCanvasContextMenu);
+    // 忽略区列表：点行选中、点 ✕ 删除（✕ 优先，不触发选中）
+    ignoreListBody.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-ignore-del]');
+      if (btn) { deleteIgnoreRect(Number(btn.dataset.ignoreDel)); return; }
+      const row = e.target.closest('tr[data-ignore]');
+      if (row) selectIgnoreRect(Number(row.dataset.ignore));
+    });
     btnVerdictDefect.addEventListener('click', () => setReviewVerdict('defect'));
     btnVerdictAccept.addEventListener('click', () => setReviewVerdict('acceptable'));
     btnReviewClear.addEventListener('click', clearSelectedReview);
@@ -1553,6 +1770,18 @@
       if (e.key === 'Escape' && (state.pending.ref || state.pending.scan)) {
         state.pending = { ref: null, scan: null };
         render();
+      }
+      // Esc 取消正在拖出的忽略区框（不保存）
+      if (e.key === 'Escape' && state.ignoreDrag) {
+        state.ignoreDrag = null;
+        drawDiffView();
+      }
+      // 选中忽略区后按 Delete/Backspace 删除（焦点不在备注框时，避免删备注文本）
+      if ((e.key === 'Delete' || e.key === 'Backspace') &&
+          state.ignoreSelected !== null &&
+          document.activeElement !== reviewNoteInput) {
+        e.preventDefault();
+        deleteIgnoreRect(state.ignoreSelected);
       }
     });
 

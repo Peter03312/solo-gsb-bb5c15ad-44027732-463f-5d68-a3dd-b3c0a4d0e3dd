@@ -711,6 +711,85 @@ const setPx = (data, w, x, y, rgba) => {
   console.log('✓ matchDiffRegions：尺寸不符 / IoU 越界 / 缺失调 BAD_INPUT');
 }
 
+// 40e. clipIgnoreRect：任意对角方向归一化、越界裁到边界、零面积框为 null
+{
+  // 正向矩形（左上 → 右下）
+  assert.deepStrictEqual(Affine.clipIgnoreRect(2, 3, 7, 9, 20, 20), { x: 2, y: 3, width: 5, height: 6 });
+  // 反向拖拽（右下 → 左上）同样归一化
+  assert.deepStrictEqual(Affine.clipIgnoreRect(7, 9, 2, 3, 20, 20), { x: 2, y: 3, width: 5, height: 6 });
+  // 四个方向越界：裁到 [0, w) × [0, h)
+  assert.deepStrictEqual(Affine.clipIgnoreRect(-5, -4, 3, 25, 20, 20), { x: 0, y: 0, width: 3, height: 20 });
+  assert.deepStrictEqual(Affine.clipIgnoreRect(15, 18, 40, 40, 20, 20), { x: 15, y: 18, width: 5, height: 2 });
+  // 完全落在图像外：与图像无交 → null
+  assert.strictEqual(Affine.clipIgnoreRect(25, 25, 30, 30, 20, 20), null);
+  assert.strictEqual(Affine.clipIgnoreRect(-10, 0, -1, 5, 20, 20), null);
+  // 零面积框：起止同像素（半开区间宽 0）/ 纯横线 / 纯竖线 → 均不保存
+  assert.strictEqual(Affine.clipIgnoreRect(5, 5, 5.2, 5.7, 20, 20), null);
+  assert.strictEqual(Affine.clipIgnoreRect(5, 5, 10, 5, 20, 20), null);
+  assert.strictEqual(Affine.clipIgnoreRect(5, 5, 5, 10, 20, 20), null);
+  // 亚像素拖拽：floor 后按半开区间取整像素列/行
+  assert.deepStrictEqual(Affine.clipIgnoreRect(5.1, 6.4, 6.9, 7.1, 20, 20), { x: 5, y: 6, width: 1, height: 1 });
+  console.log('✓ clipIgnoreRect：对角归一化、越界裁剪、与图像无交/零面积框返回 null');
+}
+
+// 40f. clipIgnoreRect 非法参数拒绝
+{
+  assert.throws(() => Affine.clipIgnoreRect(0, 0, 1, 1, 0, 2), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.clipIgnoreRect(0, 0, 1, 1, 4, -1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.clipIgnoreRect(NaN, 0, 1, 1, 4, 4), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.clipIgnoreRect(0, 0, Infinity, 1, 4, 4), (e) => e.code === 'BAD_INPUT');
+  console.log('✓ clipIgnoreRect：宽高非正 / 坐标非有限抛 BAD_INPUT');
+}
+
+// 40g. applyIgnoreRegions：掩码形成后、分组前排除；重叠只排除一次；仅统计差异像素
+{
+  const w = 5, h = 5;
+  // 差异像素：第 0 行 5 个 + (2,2) 孤立点 = 6 个
+  const mask = new Uint8Array(w * h);
+  for (let x = 0; x < 5; x++) mask[x] = 1;
+  mask[2 * w + 2] = 1;
+  // 忽略区覆盖列 0..2（3 个差异像素），另带越界宽度（自动裁剪）
+  const res = Affine.applyIgnoreRegions(mask, w, h, [{ x: -2, y: 0, width: 5, height: 1 }]);
+  assert.strictEqual(res.ignoredCount, 3, '只计被排除的差异像素（-2..0 裁到 0..2）');
+  assert.deepStrictEqual(res.rects, [{ x: 0, y: 0, width: 3, height: 1 }]);
+  // 掩码对应像素已清零，行内剩余 2 个差异像素
+  for (let x = 0; x < 3; x++) assert.strictEqual(mask[x], 0);
+  assert.strictEqual(mask[3], 1); assert.strictEqual(mask[4], 1);
+  assert.strictEqual(mask[2 * w + 2], 1, '忽略区外的孤立差异像素保留');
+
+  // 两个重叠忽略区：重叠像素只排除一次（不重复计数）；第二个右越界裁为 3 列
+  const mask2 = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) mask2[p] = 1; // 全图 25 个差异像素
+  const res2 = Affine.applyIgnoreRegions(mask2, w, h, [
+    { x: 0, y: 0, width: 4, height: 2 },  // 8 像素（列 0..3）
+    { x: 2, y: 0, width: 4, height: 2 }   // 越界裁为列 2..4 共 6 像素，与前者重叠 2×2=4 像素
+  ]);
+  assert.strictEqual(res2.ignoredCount, 10, '并集 8+6−4=10，重叠只排除一次');
+
+  // 零面积 / 无交矩形跳过不保存；空数组与 undefined 返回空结果
+  const mask3 = new Uint8Array(w * h); mask3[0] = 1;
+  const res3 = Affine.applyIgnoreRegions(mask3, w, h, [
+    { x: 100, y: 100, width: 2, height: 2 }
+  ]);
+  assert.strictEqual(res3.ignoredCount, 0);
+  assert.deepStrictEqual(res3.rects, []);
+  assert.strictEqual(mask3[0], 1);
+  const resEmpty = Affine.applyIgnoreRegions(new Uint8Array(w * h), w, h);
+  assert.strictEqual(resEmpty.ignoredCount, 0);
+  assert.deepStrictEqual(resEmpty.rects, []);
+  console.log('✓ applyIgnoreRegions：分组前排除、重叠只排除一次、零面积/无交跳过、越界裁剪');
+}
+
+// 40h. applyIgnoreRegions 非法参数拒绝
+{
+  assert.throws(() => Affine.applyIgnoreRegions(new Uint8Array(3), 2, 2, []), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.applyIgnoreRegions(new Uint8Array(4), 2, 2, {}), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.applyIgnoreRegions(new Uint8Array(4), 2, 2, [null]), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.applyIgnoreRegions(new Uint8Array(4), 2, 2, [{ x: 'a', y: 0, width: 1, height: 1 }]),
+    (e) => e.code === 'BAD_INPUT');
+  console.log('✓ applyIgnoreRegions：掩码尺寸不符 / 忽略区非法抛 BAD_INPUT');
+}
+
 // 41. 非法参数拒绝
 {
   const ref = solidImage(2, 2, [0, 0, 0]);

@@ -9,7 +9,10 @@
  * transformRGBA 像素变换。「差异区域」视图端到端验证：满足条件时复用重采样
  * 结果逐像素比较、八邻域分组并按面积展示边框/像素数/坐标范围；色差阈值与
  * 最小面积调节（含非法输入）后更新或清空；拟合无效（共线）、点位变化、
- * 非法容差等条件失效时清空旧标记并说明原因。「局部套色偏移」诊断端到端验证：
+ * 非法容差等条件失效时清空旧标记并说明原因。差异忽略区端到端验证：拖框添加
+ * （越界裁剪、零面积不保存、重叠只排除一次）立即重算差异像素与区域，增删忽略
+ * 区按实际差异像素 IoU 规则继承复核（拆分/合并不唯一时未复核），列表可查看/
+ * 删除忽略区，条件失效时忽略区保留、换图时清空。「局部套色偏移」诊断端到端验证：
  * 复用同一份校准重采样像素做 4×4 分块、±4 px 整数位移搜索、alpha≥128 与 20%
  * 可比较点门槛、dx/dy 与位移前后均差展示、JSON 导出，条件失效时清空旧诊断。
  * 同时校验 app.js 引用的所有 DOM id 都存在于 index.html。
@@ -95,7 +98,14 @@ function makeEl(tag) {
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
     querySelector(sel) { return this._q[sel] || (this._q[sel] = makeEl(sel)); },
-    closest() { return null; },
+    // 通用 closest：按 dataset 中存在的键模拟命中对应选择器的行/按钮，否则 null
+    closest(sel) {
+      if (sel === 'button[data-ignore-del]' && 'ignoreDel' in this.dataset) return this;
+      if (sel === 'tr[data-ignore]' && 'ignore' in this.dataset) return this;
+      if (sel === 'button.del' && 'id' in this.dataset) return this;
+      if (sel === 'tr[data-idx]' && 'idx' in this.dataset) return this;
+      return null;
+    },
     click() {}, remove() {}, appendChild() {}, setAttribute() {}
   };
   return el;
@@ -123,7 +133,8 @@ global.document = {
     return els[id];
   },
   createElement(tag) { return tag === 'canvas' ? makeCanvas() : makeEl(tag); },
-  body: { appendChild() {} }
+  body: { appendChild() {} },
+  activeElement: null
 };
 global.Affine = require('../public/js/affine.js');
 global.Image = class {
@@ -291,7 +302,12 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   // 2.9 人工复核：画布点击差异像素选中 → 标记结论与备注 → 表格/统计/导出同步
   const diffTbodyEl = els.diffTable.querySelector('tbody'); // app.js init 时绑定事件的同一元素
   const diffTbody = () => diffTbodyEl;
-  const clickDiffCanvas = (x, y) => fire(els.diffCanvas, 'click', { clientX: x, clientY: y });
+  const clickDiffCanvas = (x, y) => {
+    // 真实浏览器中 click 前必先有 mousedown/mouseup（无位移＝点击，不触发拖框）
+    fire(els.diffCanvas, 'mousedown', { button: 0, clientX: x, clientY: y, preventDefault() {} });
+    fireWindow('mouseup', { button: 0, clientX: x, clientY: y });
+    fire(els.diffCanvas, 'click', { clientX: x, clientY: y });
+  };
   // 模拟点击表格中带 data-idx 的行（事件委托靠 e.target.closest 找到行）
   const clickDiffTableRow = (idx) => {
     const ev = { target: { closest(sel) { return sel === 'tr[data-idx]' ? { dataset: { idx: String(idx) } } : null; } } };
@@ -387,6 +403,135 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.ok(diffTbody().innerHTML.includes('未复核'), '被最小面积过滤后恢复的区域应重新复核: ' + diffTbody().innerHTML);
   console.log('✓ 复核继承：最小面积过滤致区域消失后恢复，结论不继承');
+
+  // 2.11b 差异忽略区：拖框排除差异像素（越界裁剪、零面积不保存、重叠只排除一次）
+  const ignoreTbodyEl = els.ignoreList.querySelector('tbody');
+  const ignoreRows = () => (ignoreTbodyEl.innerHTML.match(/<tr[\s>]/g) || []).length;
+  const dragIgnore = (x0, y0, x1, y1) => {
+    fire(els.diffCanvas, 'mousedown', { button: 0, clientX: x0, clientY: y0, preventDefault() {} });
+    fireWindow('mousemove', { clientX: x1, clientY: y1 });
+    fireWindow('mouseup', { button: 0, clientX: x1, clientY: y1 });
+  };
+  const clickIgnoreRow = (n) => {
+    const ev = { target: { dataset: { ignore: String(n) },
+      closest(sel) { return sel === 'tr[data-ignore]' ? { dataset: { ignore: String(n) } } : null; } } };
+    fire(ignoreTbodyEl, 'click', ev);
+  };
+  const delIgnoreRow = (n) => {
+    const ev = { target: { dataset: { ignoreDel: String(n) },
+      closest(sel) { return sel === 'button[data-ignore-del]' ? { dataset: { ignoreDel: String(n) } } : null; } } };
+    fire(ignoreTbodyEl, 'click', ev);
+  };
+  // 前置：默认参数下 100 像素黑块差异、无忽略区
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '前置：100 差异像素');
+  assert.strictEqual(ignoreRows(), 0);
+  assert.strictEqual(els.ignoreEmpty.hidden, false, '无忽略区时应显示空态');
+  // 拖框覆盖左半黑块 x40..44（起点 x=−10 越出左边界）：裁到边界后为列 0..44，
+  // 命中黑块列 40..44 共 50 像素
+  dragIgnore(-10, 50, 45, 60);
+  assert.ok(els.diffStats.textContent.includes('差异像素 50'), '忽略后应剩 50 差异像素: ' + els.diffStats.textContent);
+  assert.ok(els.diffStats.textContent.includes('忽略区 1 个'));
+  assert.ok(els.diffStats.textContent.includes('已排除 50 差异像素'));
+  assert.strictEqual(ignoreRows(), 1);
+  assert.ok(ignoreTbodyEl.innerHTML.includes('(0, 50, 45×10)'), '负 x 起点应裁到 0: ' + ignoreTbodyEl.innerHTML);
+  assert.strictEqual(els.ignoreEmpty.hidden, true);
+  // 新框自动选中，且与差异区域选中互斥（复核编辑器隐藏）
+  assert.ok(ignoreTbodyEl.innerHTML.includes('ignore-selected'));
+  assert.strictEqual(els.reviewEditor.hidden, true);
+  console.log('✓ 差异忽略区：拖框添加（越界裁到边界）后立即重算，差异像素与统计更新，列表可查看');
+
+  // 零面积 / 越界后无交的框不保存
+  dragIgnore(46, 55, 46.5, 55.5);   // 起止同像素 → 零面积
+  dragIgnore(970, 650, 1000, 700);  // x/y 均越出 960×640 → 裁剪后无交，不保存
+  assert.strictEqual(ignoreRows(), 1, '零面积/无交框不得保存');
+  assert.ok(els.diffStats.textContent.includes('差异像素 50'));
+  // 重叠忽略区：与忽略区 1 重叠 2 列（20 像素），仅新增排除 30 像素，不重复计数
+  dragIgnore(43, 50, 48, 60);
+  assert.strictEqual(ignoreRows(), 2);
+  assert.ok(els.diffStats.textContent.includes('已排除 80 差异像素'), '重叠部分只排除一次: ' + els.diffStats.textContent);
+  assert.ok(els.diffStats.textContent.includes('差异像素 20'));
+  console.log('✓ 差异忽略区：零面积/完全越界框不保存；重叠忽略区只排除一次');
+
+  // 忽略区列表：点行选中（与复核选中互斥），✕ 删除并立即重算（删除后序号前移）
+  clickIgnoreRow(1);
+  assert.ok(ignoreTbodyEl.innerHTML.includes('ignore-selected'));
+  clickDiffCanvas(48, 55); // 点未被忽略的差异像素（列 48）：命中差异区域而非忽略区
+  assert.strictEqual(els.reviewEditor.hidden, false, '点差异像素应选中差异区域并显示复核编辑器');
+  assert.ok(!ignoreTbodyEl.innerHTML.includes('ignore-selected'), '差异区域选中后忽略区取消选中');
+  clickIgnoreRow(2);
+  assert.strictEqual(els.reviewEditor.hidden, true, '选中忽略区应与差异区域选中互斥');
+  // 右键黄框删除忽略区（点在忽略区 2 的像素 46,55 上）
+  fire(els.diffCanvas, 'contextmenu', { clientX: 46, clientY: 55, preventDefault() {} });
+  assert.strictEqual(ignoreRows(), 1, '右键黄框应删除该忽略区');
+  assert.ok(els.diffStats.textContent.includes('差异像素 50'), '删除忽略区后立即按新掩码重算');
+  console.log('✓ 差异忽略区：点行选中与差异区域互斥，右键黄框删除后立即重算');
+
+  // 忽略区拆分区域：标记缺陷后新增忽略线，左右两块互为多重叠 → 结论不继承（未复核）
+  clickDiffCanvas(46, 55); // 剩余黑块（列 45..49）的差异像素
+  fire(els.btnVerdictDefect, 'click');
+  assert.ok(diffTbody().innerHTML.includes('缺陷'), '前置：整块标为缺陷');
+  // 忽略剩余块中间列 x=47（1 列 10 像素）：把列 45..49 拆成 45..46 与 48..49 两个区域
+  dragIgnore(47, 50, 48, 60);
+  assert.strictEqual(ignoreRows(), 2);
+  assert.ok(els.diffStats.textContent.includes('保留区域 2 个'), '忽略线应把区域拆为两块: ' + els.diffStats.textContent);
+  assert.ok(diffTbody().innerHTML.includes('未复核'), '拆分后老区域与两个新区域重叠，匹配不唯一，不得继承');
+  assert.ok(!diffTbody().innerHTML.includes('缺陷'), '拆分后不得显示继承的缺陷');
+  console.log('✓ 差异忽略区：新增忽略区拆分连通区域，匹配不唯一时旧结论不继承（未复核）');
+
+  // 删除拆分忽略线 → 两块重新合并为一个区域：两侧都曾与同一老区域重叠，合并不唯一 → 仍未复核
+  delIgnoreRow(2);
+  assert.strictEqual(ignoreRows(), 1, '删除后列表序号前移');
+  assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '忽略线删除后区域重新合并');
+  assert.ok(diffTbody().innerHTML.includes('未复核'), '合并不满足互为唯一重叠，结论不恢复');
+  console.log('✓ 差异忽略区：删除忽略区导致区域合并时，结论同样不按编号恢复');
+
+  // IoU ≥ 0.5 的忽略区增删：新老区域唯一重叠 → 结论继承
+  clickDiffCanvas(46, 55);
+  fire(els.btnVerdictAccept, 'click');
+  assert.ok(diffTbody().innerHTML.includes('可接受'));
+  // 在剩余块（列 45..49）内忽略 2 列（45..46）：新区域 30 像素，IoU=30/50=0.6 ≥ 0.5 且互为唯一 → 继承
+  dragIgnore(45, 50, 47, 60);
+  assert.strictEqual(ignoreRows(), 2);
+  assert.ok(els.diffStats.textContent.includes('差异像素 30'));
+  assert.ok(diffTbody().innerHTML.includes('可接受'), 'IoU=0.6 且互为唯一重叠应继承结论');
+  // 删除该忽略区：50/30 并集 IoU=0.6，互为唯一 → 继续继承
+  delIgnoreRow(2);
+  assert.ok(diffTbody().innerHTML.includes('可接受'), '删除忽略区后唯一匹配应继承结论');
+  console.log('✓ 差异忽略区：增删忽略区且新老区域唯一重叠（IoU ≥ 0.5）时继承复核结论');
+
+  // 删除最后一个忽略区（覆盖 40..44）：整块恢复 100 像素，IoU=50/100=0.5 且互为唯一 → 边界值继承
+  delIgnoreRow(1);
+  assert.strictEqual(ignoreRows(), 0);
+  assert.strictEqual(els.ignoreEmpty.hidden, false);
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '忽略区清空后差异像素恢复 100');
+  assert.ok(!els.diffStats.textContent.includes('忽略区'), '无忽略区时统计不应再提忽略');
+  assert.ok(diffTbody().innerHTML.includes('可接受'), 'IoU 恰为 0.5 时仍应继承');
+  // 复核结论恢复后清掉以便后续用例
+  fire(els.btnReviewClear, 'click');
+  console.log('✓ 差异忽略区：删除最后一个忽略区后状态完全恢复（IoU=0.5 边界值继承）');
+
+  // 条件失效（参数非法）时忽略区保留并仍可查看/删除，恢复后重新生效
+  dragIgnore(40, 50, 50, 60);
+  assert.ok(els.diffStats.textContent.includes('未发现差异像素'), '整块被忽略后应无差异像素');
+  assert.ok(els.diffStats.textContent.includes('已排除 100 差异像素'));
+  els.diffThreshold.value = '999';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(els.diffHint.textContent.includes('色差阈值'), '参数非法应清空差异显示');
+  assert.strictEqual(ignoreRows(), 1, '参数非法时忽略区必须保留以便恢复');
+  assert.ok(ignoreTbodyEl.innerHTML.includes('(40, 50, 10×10)'));
+  // 参数恢复后忽略区重新生效：黑块被完全忽略 → 无差异像素
+  els.diffThreshold.value = '32';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.strictEqual(els.diffHint.textContent, '');
+  assert.ok(els.diffStats.textContent.includes('未发现差异像素'), '恢复后忽略区应重新生效');
+  assert.ok(els.diffStats.textContent.includes('已排除 100 差异像素'));
+  // 删除忽略区，恢复默认差异状态供后续用例
+  fire(els.diffCanvas, 'contextmenu', { clientX: 45, clientY: 55, preventDefault() {} });
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '删除忽略区后黑块差异恢复');
+  console.log('✓ 差异忽略区：参数非法清空差异显示时保留忽略区，恢复后重新生效');
 
   // 2.12 局部套色偏移诊断：复用校准重采样像素，4×4 分块、±4 px 位移搜索、20% 门槛
   const localTbodyEl = els.localTable.querySelector('tbody');
@@ -727,6 +872,9 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(diffTbody().innerHTML.includes('未复核'), '换图后区域应为未复核: ' + diffTbody().innerHTML);
   assert.strictEqual(els.reviewEditor.hidden, true, '换图后不应保留选中区域');
   assert.ok(els.diffStats.textContent.includes('未复核 1'), '换图后复核统计应重置: ' + els.diffStats.textContent);
+  assert.strictEqual((els.ignoreList.querySelector('tbody').innerHTML.match(/<tr[\s>]/g) || []).length, 0,
+    '换图后忽略区必须清空');
+  assert.strictEqual(els.ignoreEmpty.hidden, false);
   // 导出 JSON 同样不含旧结论
   fire(els.btnExportReview, 'click');
   const djReset = JSON.parse(await blobs[blobs.length - 1].text());

@@ -31,13 +31,16 @@
  * RGB 归零；各通道四舍五入到 0~255。矩阵含非有限值或线性部分行列式绝对值
  * ≤ MIN_MATRIX_DET（1e-12）时拒绝（checkExportMatrix / invertMatrix）。
  *
- * 差异区域检测（buildDifferenceMask / groupDiffRegions / findDifferenceRegions，
- * 可独立调用，纯像素计算、不依赖 DOM）：比较参考图与按拟合矩阵重采样后的
- * 校准扫描图，仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素，任一 RGB
- * 通道差值的绝对值超过色差阈值（0~255，严格大于）即标为差异像素；再对差异
- * 掩码做八邻域连通分组，过滤像素数小于最小面积的区域，剩余区域按面积降序
- * 输出边框、像素数与坐标范围，并给出每像素区域编号标签 labels（供点击命中
- * 与重算时的区域交并比匹配 matchDiffRegions 使用）。
+ * 差异区域检测（buildDifferenceMask / applyIgnoreRegions / groupDiffRegions /
+ * findDifferenceRegions，可独立调用，纯像素计算、不依赖 DOM）：比较参考图与按
+ * 拟合矩阵重采样后的校准扫描图，仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的
+ * 像素，任一 RGB 通道差值的绝对值超过色差阈值（0~255，严格大于）即标为差异像素；
+ * 差异掩码形成后、八邻域连通分组前，可用 applyIgnoreRegions 按若干参考图像素
+ * 矩形忽略区排除像素（印刷稿裁切线、装订孔等本就与参考图不同的位置），重叠
+ * 部分只排除一次，越界矩形由 clipIgnoreRect 裁到图像边界，零面积框不保存；
+ * 随后再分组并过滤像素数小于最小面积的区域，剩余区域按面积降序输出边框、
+ * 像素数与坐标范围，并给出每像素区域编号标签 labels（供点击命中与重算时的
+ * 区域交并比匹配 matchDiffRegions 使用）。
  *
  * 人工复核继承（matchDiffRegions，可独立调用，纯像素计算）：参数（色差阈值、
  * 最小面积）或控制点引发重算后，新老区域一律以区域内实际差异像素计算交并比
@@ -608,6 +611,102 @@
   }
 
   /**
+   * 把忽略区矩形（参考图原始像素坐标）裁到 [0, w) × [0, h) 的图像边界内。
+   *
+   * 矩形可从任一对角方向给出（x1/y1 与 x2/y2 无需有序），内部按最小/最大值
+   * 归一化后与图像边界取交；坐标按半开像素区间处理：像素列为
+   * [floor(xMin), floor(xMax))、像素行为 [floor(yMin), floor(yMax))，因此
+   * 归一化后宽或高为 0（含拖拽起止落在同一像素的零面积框）时返回 null，
+   * 调用方不应保存该忽略区。
+   *
+   * @param {number} x1 拖拽起点（或任一角点）x（参考图像素，可为负/越界）
+   * @param {number} y1 拖拽起点（或任一角点）y
+   * @param {number} x2 拖拽终点（或对向角点）x
+   * @param {number} y2 拖拽终点（或对向角点）y
+   * @param {number} w 图像宽（正整数）
+   * @param {number} h 图像高（正整数）
+   * @returns {{x:number,y:number,width:number,height:number}|null}
+   *          裁剪后的左上角与边长（width/height 均为正整数）；零面积为 null
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function clipIgnoreRect(x1, y1, x2, y2, w, h) {
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) {
+      throw new FitError('BAD_INPUT', '忽略区裁剪的图像宽高必须为正整数');
+    }
+    const nums = [x1, y1, x2, y2];
+    if (nums.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
+      throw new FitError('BAD_INPUT', '忽略区坐标必须为有限数字');
+    }
+    // 半开像素区间：[floor(min), floor(max))，再与图像边界 [0, w/h) 取交
+    const fx = Math.min(Math.floor(nums[0]), Math.floor(nums[2]));
+    const tx = Math.max(Math.floor(nums[0]), Math.floor(nums[2]));
+    const fy = Math.min(Math.floor(nums[1]), Math.floor(nums[3]));
+    const ty = Math.max(Math.floor(nums[1]), Math.floor(nums[3]));
+    const x = Math.max(0, fx);
+    const y = Math.max(0, fy);
+    const right = Math.min(w, tx);
+    const bottom = Math.min(h, ty);
+    const width = right - x;
+    const height = bottom - y;
+    if (width <= 0 || height <= 0) return null; // 零面积框（越界后无交也算在内）不保存
+    return { x, y, width, height };
+  }
+
+  /**
+   * 在差异掩码形成后、八邻域分组前，按忽略区矩形排除像素（可独立调用，纯像素
+   * 计算，不依赖 DOM/Canvas）。用于裁切线、装订孔等本就与参考图不同的位置：
+   * 这些像素既不参与八邻域分组（可能拆分连通区域），也不计入差异像素数与
+   * 红色差异覆盖层。
+   *
+   * 规则：
+   *   - 每个忽略区先经 clipIgnoreRect 裁到图像边界（可由任一对角方向给出），
+   *     裁剪后为零面积的矩形直接跳过（不保存）；
+   *   - 多个忽略区的重叠部分只排除一次（以掩码当前字节为准，重复清零无副作用）；
+   *   - 仅原本为差异像素（掩码字节非 0）且落在忽略区内的像素计入 ignoredCount，
+   *     与忽略区几何面积无关。
+   *
+   * @param {Uint8Array} mask buildDifferenceMask 输出的每像素 1 字节掩码（就地清零）
+   * @param {number} w 宽
+   * @param {number} h 高
+   * @param {Array<{x:number,y:number,width:number,height:number}>} [ignoreRects]
+   *        忽略区（参考图像素坐标；width/height 为正，可越界，内部统一裁剪）
+   * @returns {{ignoredCount:number, rects:Array<{x:number,y:number,
+   *            width:number,height:number}>}}
+   *          ignoredCount 被排除的差异像素数；rects 为各忽略区裁剪后的实际矩形
+   *          （零面积/越界无交的不包含）
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function applyIgnoreRegions(mask, w, h, ignoreRects) {
+    if (!mask || !Number.isInteger(w) || !Number.isInteger(h) ||
+        w <= 0 || h <= 0 || mask.length !== w * h) {
+      throw new FitError('BAD_INPUT', '差异掩码缺失或长度与宽高不符');
+    }
+    const rects = [];
+    let ignoredCount = 0;
+    if (!ignoreRects) return { ignoredCount, rects };
+    if (!Array.isArray(ignoreRects)) {
+      throw new FitError('BAD_INPUT', '忽略区必须为矩形数组');
+    }
+    for (const r of ignoreRects) {
+      if (!r) throw new FitError('BAD_INPUT', '忽略区矩形缺失');
+      // 已保存的忽略区为左上角 + 边长；直接交给 clipIgnoreRect 做边界裁剪与零面积判定
+      const clipped = clipIgnoreRect(r.x, r.y, r.x + r.width, r.y + r.height, w, h);
+      if (!clipped) continue; // 零面积 / 与图像无交：不保存
+      rects.push(clipped);
+      const endX = clipped.x + clipped.width;
+      const endY = clipped.y + clipped.height;
+      for (let y = clipped.y; y < endY; y++) {
+        let p = y * w + clipped.x;
+        for (let x = clipped.x; x < endX; x++, p++) {
+          // 重叠忽略区在同一像素上只排除一次：仅非 0 像素计数后清零
+          if (mask[p]) { mask[p] = 0; ignoredCount++; }
+        }
+      }
+    }
+    return { ignoredCount, rects };
+  }
+
+  /**
    * 对差异掩码做八邻域连通分组（可独立调用，纯像素计算）。
    *
    * 以八邻域（含对角）连通的掩码像素归为同一区域（迭代式泛洪，避免大图爆栈）；
@@ -1050,6 +1149,8 @@
     invertMatrix,
     transformRGBA,
     buildDifferenceMask,
+    clipIgnoreRect,
+    applyIgnoreRegions,
     groupDiffRegions,
     findDifferenceRegions,
     matchDiffRegions,
